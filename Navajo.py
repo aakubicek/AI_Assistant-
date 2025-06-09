@@ -36,90 +36,60 @@ selected_audio_device = None  # Store the selected audio device
 is_listening = threading.Event()  # Flag to control audio listening
 
 # ========== AUDIO CAPTURE ==========
-def audio_callback(indata, frames, time_, status):
+def audio_callback(outdata, frames, time_, status):
     """
-    Callback function for audio input stream with enhanced logging.
+    Callback function for audio output stream with enhanced logging.
+    
+    Args:
+        outdata (numpy.ndarray): Output data buffer
+        frames (int): Number of frames
+        time_ (CData): Timing information
+        status (sd.CallbackFlags): Status flags
     """
     if not is_listening.is_set():
         return
     
     if status:
-        logging.warning(f"Audio input status: {status}")
+        logging.warning(f"Audio output status: {status}")
     
     try:
         # Only add to queue if there's actual audio data and listening is active
-        if indata is not None and len(indata) > 0 and is_listening.is_set():
-            audio_queue.put(indata.copy())
+        if outdata is not None and len(outdata) > 0 and is_listening.is_set():
+            # Convert to mono if stereo
+            if outdata.ndim > 1:
+                outdata = outdata.mean(axis=1)
+            
+            audio_queue.put(outdata.copy())
     except Exception as e:
-        logging.error(f"Error in audio callback: {e}")
-
-def start_audio_stream(device=None):
-    """
-    Start audio input stream with comprehensive error handling and logging.
-    
-    Args:
-        device (int, optional): Specific device index to use. Defaults to None.
-    """
-    try:
-        # List available devices for debugging
-        logging.info("Available Audio Devices:")
-        devices = sd.query_devices()
-        default_input = sd.default.device[0]
-        logging.info(f"Default Input Device: {default_input}")
-        
-        # Use specified device or default
-        input_device = device if device is not None else default_input
-        
-        # Attempt to open input stream with specific parameters
-        stream = sd.InputStream(
-            callback=audio_callback,
-            channels=1,  # Mono input
-            samplerate=16000,  # Standard Whisper sample rate
-            dtype='float32',
-            device=input_device
-        )
-        
-        # Start listening
-        is_listening.set()
-        stream.start()
-        
-        # Update status
-        status_var.set(f"🎤 Listening on device {input_device}")
-        
-        return stream
-    except Exception as e:
-        logging.error(f"Error starting audio stream: {e}")
-        status_var.set(f"❌ Audio Error: {e}")
-        tk.messagebox.showerror("Audio Error", 
-                                f"Could not start audio input: {e}")
+        logging.error(f"Error in audio output callback: {e}")
         is_listening.clear()
-        return None
 
 def list_audio_devices():
-    """List available audio input devices."""
-    print("Available Audio Input Devices:")
+    """List available audio output devices."""
+    print("Available Audio Output Devices:")
     devices = sd.query_devices()
     for i, device in enumerate(devices):
-        if device['max_input_channels'] > 0:
+        if device['max_output_channels'] > 0:
             print(f"Device {i}: {device['name']}")
 
 def test_audio_input(duration=5, sample_rate=16000):
     """
-    Test audio input and transcribe without saving files.
+    Test system audio output and transcribe.
     
     Args:
         duration (int): Recording duration in seconds
         sample_rate (int): Audio sample rate
     """
-    print(f"Testing audio input for {duration} seconds...")
-    print("Please speak into your microphone...")
+    print(f"Testing system audio output for {duration} seconds...")
+    print("Please play audio on your system...")
     
     try:
-        # Record audio
+        # Record system audio
         recording = sd.rec(int(duration * sample_rate), 
                            samplerate=sample_rate, 
                            channels=1, 
-                           dtype='float32')
+                           dtype='float32',
+                           device=sd.default.device[1])  # Use default output device
         sd.wait()  # Wait until recording is finished
         
         # Flatten the recording to 1D array
@@ -136,7 +106,7 @@ def test_audio_input(duration=5, sample_rate=16000):
         print("Detected Language:", result['language'])
         
     except Exception as e:
-        print(f"Error during audio test: {e}")
+        print(f"Error during system audio test: {e}")
         import traceback
         traceback.print_exc()
 
