@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.env
+.venv
+env/
+ENV/
+
+# IDE settings
+.vscode/
+.idea/
+
+# Logs
+*.log
+interview_assistant.log
+
+# Audio and temporary files
+*.wav
+temp.wav
+
+# Sensitive information
+*.key
+*.pem
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Specific project files
+interview_transcript.pdf 

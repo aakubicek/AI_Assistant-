@@ -1,0 +1,7 @@
+openai
+langchain
+pyaudio
+sounddevice
+whisper
+PyPDF2
+fpdf 
