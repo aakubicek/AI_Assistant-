@@ -220,8 +220,8 @@ main_frame.pack(fill=tk.BOTH, expand=True)
 # Audio Input Guidance Label
 audio_guidance = tk.Label(
     main_frame, 
-    text="🎤 Speak clearly into your microphone\n"
-         "Ask interview questions, and I'll help you prepare answers.",
+    text="🎤 \n"
+         "Have the interviewer ask questions, and I'll help you prepare answers.",
     font=("Arial", 12),
     justify=tk.CENTER,
     wraplength=500
@@ -584,6 +584,53 @@ def main():
         logging.error(f"Fatal error in main application: {e}")
         import traceback
         traceback.print_exc()
+
+def start_audio_stream(device=None):
+    """
+    Start audio stream with comprehensive error handling and logging.
+    
+    Args:
+        device (int, optional): Specific device index to use. Defaults to None.
+    
+    Returns:
+        sd.InputStream or None: Audio stream object or None if failed
+    """
+    try:
+        # List available devices for debugging
+        logging.info("Available Audio Devices:")
+        devices = sd.query_devices()
+        
+        # Determine input device
+        default_input = sd.default.device[0]
+        logging.info(f"Default Input Device: {default_input}")
+        
+        # Use specified device or default
+        input_device = device if device is not None else default_input
+        
+        # Attempt to open input stream with specific parameters
+        stream = sd.InputStream(
+            callback=audio_callback,
+            channels=1,  # Mono input
+            samplerate=16000,  # Standard Whisper sample rate
+            dtype='float32',
+            device=input_device
+        )
+        
+        # Start listening
+        is_listening.set()
+        stream.start()
+        
+        # Update status
+        status_var.set(f"🎤 Listening on device {input_device}")
+        
+        return stream
+    except Exception as e:
+        logging.error(f"Error starting audio stream: {e}")
+        status_var.set(f"❌ Audio Error: {e}")
+        tk.messagebox.showerror("Audio Error", 
+                                f"Could not start audio input: {e}")
+        is_listening.clear()
+        return None
 
 if __name__ == "__main__":
     main()
