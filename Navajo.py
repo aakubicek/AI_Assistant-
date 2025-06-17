@@ -1,23 +1,31 @@
-# interview_ai_assistant.py
-
+# Standard library imports
 import os
+import sys
 import time
+import io
+import queue
+import logging
 import threading
+import traceback
+from collections import defaultdict
+
+# Third-party library imports
+import numpy as np
+import openai
+import whisper
+import sounddevice as sd
 import tkinter as tk
 from tkinter import filedialog, simpledialog, scrolledtext, messagebox
 from PyPDF2 import PdfReader
-import openai
-import sounddevice as sd
-import queue
-import whisper
+from pydub import AudioSegment
+from fpdf import FPDF
+
+# Machine Learning and AI imports
 from langchain_community.chat_models import ChatOpenAI
 from langchain.chains import ConversationChain
 from langchain.memory import ConversationBufferMemory
-import numpy as np
-import io
 
 # Logging setup
-import logging
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -28,41 +36,42 @@ logging.basicConfig(
 )
 
 # ========== GLOBAL VARIABLES ==========
+# Global flag to track interview status
+print("Setting up global variables...")
+interview_completed = False
 audio_queue = queue.Queue()
 transcript_log = []
 resume_text = ""
 custom_prompt = ""
 selected_audio_device = None  # Store the selected audio device
 is_listening = threading.Event()  # Flag to control audio listening
+is_paused = False
 
 # ========== AUDIO CAPTURE ==========
+def preprocess_audio(audio_data):
+    """Preprocess audio data to enhance quality."""
+    # Convert to AudioSegment
+    audio_segment = AudioSegment(
+        audio_data.tobytes(),
+        frame_rate=16000,
+        sample_width=2,  # Assuming 16-bit audio
+        channels=1
+    )
+    
+    # Normalize audio
+    normalized_audio = audio_segment.apply_gain(-audio_segment.dBFS)
+    
+    return normalized_audio
+
 def audio_callback(outdata, frames, time_, status):
-    """
-    Callback function for audio output stream with enhanced logging.
-    
-    Args:
-        outdata (numpy.ndarray): Output data buffer
-        frames (int): Number of frames
-        time_ (CData): Timing information
-        status (sd.CallbackFlags): Status flags
-    """
-    if not is_listening.is_set():
-        return
-    
+    """Callback function for audio output stream."""
     if status:
-        logging.warning(f"Audio output status: {status}")
-    
-    try:
-        # Only add to queue if there's actual audio data and listening is active
-        if outdata is not None and len(outdata) > 0 and is_listening.is_set():
-            # Convert to mono if stereo
-            if outdata.ndim > 1:
-                outdata = outdata.mean(axis=1)
-            
-            audio_queue.put(outdata.copy())
-    except Exception as e:
-        logging.error(f"Error in audio output callback: {e}")
-        is_listening.clear()
+        print(status)
+    if is_listening.is_set() and not is_paused:
+        # Capture audio data
+        audio_data = np.frombuffer(outdata, dtype=np.float32)
+        processed_audio = preprocess_audio(audio_data)
+        audio_queue.put(processed_audio)
 
 def list_audio_devices():
     """List available audio output devices."""
@@ -114,14 +123,16 @@ def test_audio_input(duration=5, sample_rate=16000):
 whisper_model = whisper.load_model("base")
 
 def transcribe_audio():
-    """
-    Transcribe audio with comprehensive error handling and logging.
-    """
+    """Transcribe audio with comprehensive error handling and logging."""
     logging.info("Audio transcription thread started.")
     audio_buffer = []
     
     try:
         while is_listening.is_set():
+            if is_paused:
+                time.sleep(0.5)  # Wait if paused
+                continue
+            
             try:
                 # Wait for audio data with a timeout
                 data = audio_queue.get(timeout=1)
@@ -134,15 +145,12 @@ def transcribe_audio():
                     # Concatenate audio data
                     audio_np = np.concatenate(audio_buffer)
                     
-                    # Ensure audio is in correct format for Whisper
-                    if audio_np.ndim > 1:
-                        audio_np = audio_np.flatten()
-                    
-                    # Transcribe
+                    # Transcribe using Whisper
                     result = whisper_model.transcribe(
-                        audio_np, 
-                        language='en',  # Specify language to improve accuracy
-                        fp16=False  # Disable FP16 to avoid potential issues
+                        audio_np,
+                        language='en',
+                        task='transcribe',
+                        fp16=False
                     )
                     
                     transcript = result['text'].strip()
@@ -156,18 +164,14 @@ def transcribe_audio():
                     audio_buffer.clear()
             
             except queue.Empty:
-                # No audio data received, continue waiting
                 logging.debug("Waiting for audio input...")
                 time.sleep(0.5)
             except Exception as e:
                 logging.error(f"Error in audio transcription: {e}")
-                # Clear buffer on error
                 audio_buffer.clear()
     
     except Exception as e:
         logging.error(f"Fatal error in audio transcription thread: {e}")
-        import traceback
-        traceback.print_exc()
     finally:
         logging.info("Audio transcription thread stopped.")
         is_listening.clear()
@@ -175,12 +179,19 @@ def transcribe_audio():
 def update_transcript(transcript):
     """
     Update transcript and generate response from the main thread.
+    Modified to enable Interview Complete button when responses start.
     """
     try:
+        # Only enable the button after first transcript entry
+        if interview_complete_btn['state'] == tk.DISABLED:
+            interview_complete_btn.config(state=tk.NORMAL)
+        
         transcript_log.append(("Other", transcript))
         generate_response(transcript)
     except Exception as e:
         logging.error(f"Error updating transcript: {e}")
+        import traceback
+        traceback.print_exc()
 
 # ========== LANGCHAIN SETUP ==========
 llm = None
@@ -192,14 +203,26 @@ def setup_llm(api_key):
     try:
         print(f"Attempting to set up LLM with API key: {api_key[:5]}...")
         openai.api_key = api_key
-        llm = ChatOpenAI(openai_api_key=api_key, model_name="gpt-4o")
+        
+        # Use GPT-4o mini model
+        llm = ChatOpenAI(
+            openai_api_key=api_key, 
+            model_name="gpt-4o-mini",  # Specify the GPT-4o mini model
+            temperature=0.7,  # Add some creativity for interview feedback
+            max_tokens=300   # Limit response length for concise feedback
+        )
         
         # Verify LLM is working
         test_response = llm.invoke("Hello, can you confirm you're working?")
         print("LLM test response:", test_response)
         
+        # Setup conversation chain with memory
         memory = ConversationBufferMemory()
-        conversation = ConversationChain(llm=llm, memory=memory)
+        conversation = ConversationChain(
+            llm=llm, 
+            memory=memory,
+            verbose=True  # Enable verbose mode for more detailed logging
+        )
         print("LLM setup completed successfully.")
     except Exception as e:
         print(f"Error setting up LLM: {e}")
@@ -208,6 +231,7 @@ def setup_llm(api_key):
         raise
 
 # ========== GUI ==========
+print("Initializing Tkinter root window...")
 root = tk.Tk()
 root.title("Interview Assistant")
 root.geometry("600x400")  # Larger window
@@ -278,37 +302,132 @@ def generate_response(question):
 
 # ========== TRANSCRIPT OUTPUT ==========
 def export_transcript():
+    """
+    Generate a summary of the interview transcript with an AI-powered performance review.
+    Allows user to choose where to save the PDF.
+    """
     from fpdf import FPDF
+    from collections import defaultdict
+    import os
+    import sys
+    
+    # Ensure we have a conversation chain
+    if not conversation:
+        tk.messagebox.showerror("Error", "LLM not initialized for performance review")
+        return
+    
+    # Only generate summary if interview was actually completed
+    if not interview_completed or len(transcript_log) < 2:
+        tk.messagebox.showwarning("Warning", "No interview data to summarize.")
+        return
+    
+    # Group transcript by speaker
+    speaker_summaries = defaultdict(list)
+    for speaker, text in transcript_log:
+        speaker_summaries[speaker].append(text)
+    
+    # Generate performance review using the LLM
+    try:
+        performance_review_prompt = (
+            "Provide a professional performance review based on the interview responses. "
+            "Include a numerical rating out of 10, highlighting strengths and areas for improvement. "
+            "Be constructive and specific. The review should be concise but informative. "
+            "Responses were: " + " ".join(speaker_summaries.get("Other", []))
+        )
+        performance_review = conversation.run(performance_review_prompt)
+    except Exception as e:
+        logging.error(f"Error generating performance review: {e}")
+        performance_review = "Unable to generate performance review due to an error."
+    
+    # Open file dialog to choose save location
+    pdf_filename = filedialog.asksaveasfilename(
+        defaultextension=".pdf",
+        filetypes=[("PDF files", "*.pdf")],
+        title="Save Interview Performance Summary"
+    )
+    
+    # If user cancels save dialog
+    if not pdf_filename:
+        tk.messagebox.showinfo("Save Cancelled", "PDF export was cancelled.")
+        return
+    
+    # Create PDF with summary and review
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.set_font("Arial", size=12)
-    for speaker, text in transcript_log:
-        pdf.multi_cell(0, 10, f"{speaker}: {text}")
-    pdf.output("interview_transcript.pdf")
+    
+    # Title
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(0, 10, "Interview Performance Summary", ln=True)
+    pdf.ln(10)
+    
+    # Performance Review Section
+    pdf.set_font("Arial", 'B', 14)
+    pdf.cell(0, 10, "Performance Review", ln=True)
+    pdf.set_font("Arial", size=12)
+    pdf.multi_cell(0, 10, performance_review)
+    pdf.ln(10)
+    
+    # Transcript Summary Section
+    pdf.set_font("Arial", 'B', 14)
+    pdf.cell(0, 10, "Transcript Summary", ln=True)
+    pdf.set_font("Arial", size=12)
+    
+    # Summarize each speaker's contributions
+    for speaker, texts in speaker_summaries.items():
+        # Combine texts and truncate if too long
+        combined_text = " ".join(texts)
+        
+        # Basic summarization: first 200 characters and ellipsis if longer
+        summary = combined_text[:200] + (f"... (truncated)" if len(combined_text) > 200 else "")
+        
+        # Add speaker summary
+        pdf.cell(0, 10, f"{speaker} Summary:", ln=True, style='B')
+        pdf.multi_cell(0, 10, summary)
+        pdf.ln(5)  # Add some spacing between summaries
+    
+    # Add timestamp
+    pdf.set_font("Arial", 'I', 10)
+    pdf.cell(0, 10, f"Generated on: {time.strftime('%Y-%m-%d %H:%M:%S')}", ln=True)
+    
+    # Output the PDF to chosen location
+    pdf.output(pdf_filename)
+    
+    # Show a message that summary is ready
+    tk.messagebox.showinfo("Performance Summary", 
+                            f"Interview performance summary has been saved to {pdf_filename}")
+    
+    # Reset interview status
+    global interview_completed
+    interview_completed = False
+    
+    # Reset UI
+    interview_complete_btn.config(state=tk.NORMAL)
+    status_var.set("Ready for next interview")
 
 # ========== AUDIO DEVICE SELECTION ==========
 def get_input_devices():
     """
-    Retrieve a list of available audio input devices.
+    Retrieve a list of available audio output devices.
     
     Returns:
         list: A list of dictionaries containing device information
     """
     devices = sd.query_devices()
-    input_devices = []
+    output_devices = []
     for i, device in enumerate(devices):
-        if device['max_input_channels'] > 0:
-            input_devices.append({
+        if device['max_output_channels'] > 0:
+            output_devices.append({
                 'index': i,
                 'name': device['name'],
                 'default_samplerate': device.get('default_samplerate', 44100)
             })
-    return input_devices
+    return output_devices
 
 def create_device_selection_dialog(root):
     """
-    Create a dialog for selecting audio input device.
+    Create a dialog for selecting audio output device.
     
     Args:
         root (tk.Tk): The main root window
@@ -318,17 +437,17 @@ def create_device_selection_dialog(root):
     """
     # Create a top-level window for device selection
     device_window = tk.Toplevel(root)
-    device_window.title("Select Audio Input Device")
+    device_window.title("Select System Audio Output Device")
     device_window.geometry("500x400")
     device_window.transient(root)
     device_window.grab_set()
 
     # Title and instructions
     tk.Label(device_window, 
-             text="Select Your Audio Input Device", 
+             text="Select Your System Audio Output Device", 
              font=("Arial", 14, "bold")).pack(pady=10)
     tk.Label(device_window, 
-             text="Choose the microphone you want to use for the interview assistant",
+             text="Choose the audio output device you want to listen to",
              wraplength=450).pack(pady=5)
 
     # Variable to store selected device
@@ -352,13 +471,16 @@ def create_device_selection_dialog(root):
     device_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     scrollbar.config(command=device_listbox.yview)
 
-    # Populate listbox with devices
-    input_devices = get_input_devices()
-    default_device_index = sd.default.device[0]
+    # Populate listbox with output devices
+    output_devices = [
+        device for device in sd.query_devices() 
+        if device['max_output_channels'] > 0
+    ]
+    default_device_index = sd.default.device[1]
     
-    for i, device in enumerate(input_devices):
-        device_info = f"{device['index']}: {device['name']}"
-        if device['index'] == default_device_index:
+    for i, device in enumerate(output_devices):
+        device_info = f"{i}: {device['name']}"
+        if i == default_device_index:
             device_info += " [DEFAULT]"
         device_listbox.insert(tk.END, device_info)
 
@@ -370,7 +492,7 @@ def create_device_selection_dialog(root):
         nonlocal selected_device_index
         selection = device_listbox.curselection()
         if selection:
-            selected_device_index = input_devices[selection[0]]['index']
+            selected_device_index = selection[0]
             device_window.destroy()
         else:
             tk.messagebox.showwarning("Selection", "Please select a device.")
@@ -549,6 +671,8 @@ root.protocol("WM_DELETE_WINDOW", on_closing)
 def main():
     import sys
     
+    print("Starting Interview Assistant...")
+    
     if len(sys.argv) > 1:
         if sys.argv[1] == 'list-devices':
             list_audio_devices()
@@ -558,7 +682,7 @@ def main():
             return
     
     try:
-        logging.info("Initializing Interview Assistant...")
+        print("Initializing Interview Assistant...")
         
         # Ensure root window is fully initialized and visible
         root.update()
@@ -569,68 +693,141 @@ def main():
         # Start setup in a way that doesn't block the main thread
         def delayed_setup():
             try:
+                print("Running delayed setup...")
                 start_setup()
             except Exception as e:
-                logging.error(f"Setup error: {e}")
+                print(f"Setup error: {e}")
+                import traceback
+                traceback.print_exc()
                 tk.messagebox.showerror("Setup Error", str(e))
         
         # Use after method to start setup
         root.after(100, delayed_setup)
         
         # Start the main event loop
-        logging.info("Starting Tkinter main loop...")
+        print("Starting Tkinter main loop...")
         root.mainloop()
     except Exception as e:
-        logging.error(f"Fatal error in main application: {e}")
+        print(f"Fatal error in main application: {e}")
         import traceback
         traceback.print_exc()
 
 def start_audio_stream(device=None):
-    """
-    Start audio stream with comprehensive error handling and logging.
-    
-    Args:
-        device (int, optional): Specific device index to use. Defaults to None.
-    
-    Returns:
-        sd.InputStream or None: Audio stream object or None if failed
-    """
+    """Start audio stream with comprehensive error handling and logging."""
     try:
-        # List available devices for debugging
-        logging.info("Available Audio Devices:")
-        devices = sd.query_devices()
-        
-        # Determine input device
-        default_input = sd.default.device[0]
-        logging.info(f"Default Input Device: {default_input}")
-        
-        # Use specified device or default
-        input_device = device if device is not None else default_input
-        
-        # Attempt to open input stream with specific parameters
         stream = sd.InputStream(
             callback=audio_callback,
-            channels=1,  # Mono input
-            samplerate=16000,  # Standard Whisper sample rate
-            dtype='float32',
-            device=input_device
+            channels=1,
+            samplerate=16000,
+            dtype='float32'
         )
         
-        # Start listening
         is_listening.set()
         stream.start()
-        
-        # Update status
-        status_var.set(f"🎤 Listening on device {input_device}")
         
         return stream
     except Exception as e:
         logging.error(f"Error starting audio stream: {e}")
-        status_var.set(f"❌ Audio Error: {e}")
-        tk.messagebox.showerror("Audio Error", 
-                                f"Could not start audio input: {e}")
         is_listening.clear()
         return None
+
+# Create a frame for control buttons
+control_frame = tk.Frame(main_frame)
+control_frame.pack(pady=10)
+
+# Pause Interview Button
+pause_btn = tk.Button(
+    control_frame, 
+    text="⏸️ Pause Interview", 
+    command=lambda: toggle_pause(),
+    bg='lightyellow',
+    font=("Arial", 12, "bold")
+)
+pause_btn.pack(side=tk.LEFT, padx=5)
+
+# Interview Complete Button
+interview_complete_btn = tk.Button(
+    control_frame, 
+    text="🏁 Interview Complete", 
+    command=lambda: end_interview(),
+    bg='lightgreen',
+    font=("Arial", 12, "bold"),
+    state=tk.NORMAL  # Initially enabled
+)
+interview_complete_btn.pack(side=tk.LEFT, padx=5)
+
+def end_interview():
+    """
+    Handle the end of the interview process.
+    Stops listening, enables summary generation, and triggers export.
+    """
+    global is_listening, interview_completed
+    
+    # Stop audio listening
+    is_listening.clear()
+    
+    # Mark interview as completed
+    interview_completed = True
+    
+    # Disable the complete button after it's pressed
+    interview_complete_btn.config(state=tk.DISABLED)
+    
+    # Update status
+    status_var.set("🏁 Interview Completed. Generating Summary...")
+    
+    # Generate and export transcript
+    export_transcript()
+    
+    # Show completion message
+    tk.messagebox.showinfo("Interview Complete", 
+                            "Interview summary has been generated.")
+
+def toggle_pause():
+    """
+    Toggle between paused and unpaused states during the interview.
+    """
+    global is_paused, is_listening
+    
+    if not is_paused:
+        # Pause the interview
+        is_paused = True
+        is_listening.clear()
+        pause_btn.config(
+            text="▶️ Unpause Interview", 
+            bg='lightgreen'
+        )
+        status_var.set("⏸️ Interview Paused")
+        
+        # Optional: Add a visual indicator of pause
+        audio_guidance.config(
+            text="🛑 Interview Paused\n"
+                 "Click 'Unpause' to continue",
+            fg='red'
+        )
+    else:
+        # Unpause the interview
+        is_paused = False
+        is_listening.set()
+        pause_btn.config(
+            text="⏸️ Pause Interview", 
+            bg='lightyellow'
+        )
+        status_var.set("🎤 Interview Resumed")
+        
+        # Restore original guidance text
+        audio_guidance.config(
+            text="🎤 \n"
+                 "Have the interviewer ask questions, and I'll help you prepare answers.",
+            fg='black'
+        )
+        
+        # Restart audio stream if needed
+        try:
+            start_audio_stream(device=selected_audio_device)
+        except Exception as e:
+            logging.error(f"Error restarting audio stream: {e}")
+            tk.messagebox.showerror("Audio Error", 
+                                    f"Could not resume audio stream: {e}")
 
 if __name__ == "__main__":
     main()
